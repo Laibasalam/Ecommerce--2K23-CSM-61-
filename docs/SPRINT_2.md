@@ -1,129 +1,277 @@
--- Sprint 2: Catalog Data Foundation
--- Migration: 002_catalog_foundation.sql
--- Database: PostgreSQL
+# Sprint 2: Catalog Data Foundation
 
--- ---------- CATEGORIES ----------
-CREATE TABLE IF NOT EXISTS CATEGORIES (
-    category_id   SERIAL PRIMARY KEY,
-    parent_id     INTEGER NULL,
-    name          VARCHAR(100)  NOT NULL,
-    slug          VARCHAR(120)  NOT NULL,
-    is_active     BOOLEAN       NOT NULL DEFAULT TRUE,
-    created_at    TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at    TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_categories_slug UNIQUE (slug),
-    CONSTRAINT fk_categories_parent
-        FOREIGN KEY (parent_id) REFERENCES CATEGORIES (category_id)
-        ON UPDATE CASCADE ON DELETE RESTRICT
-);
+**Project:** TechBazar – Online Store for Consumer Electronics
+**Repository:** Ecommerce--2K23-CSM-61-
+**Branch:** main
+**Deadline:** 2nd October 2026
 
-CREATE INDEX IF NOT EXISTS idx_categories_parent_id ON CATEGORIES (parent_id);
+## 1. Sprint goal and scope boundary
 
--- Category khud apna ancestor nahi ban sakti (CAT-01)
-CREATE OR REPLACE FUNCTION prevent_category_cycle() RETURNS trigger AS $$
-DECLARE
-    cur   INTEGER;
-    depth INTEGER := 0;
-BEGIN
-    IF NEW.parent_id IS NULL THEN
-        RETURN NEW;
-    END IF;
-    IF NEW.parent_id = NEW.category_id THEN
-        RAISE EXCEPTION 'category cannot be its own parent';
-    END IF;
-    cur := NEW.parent_id;
-    WHILE cur IS NOT NULL AND depth < 50 LOOP
-        SELECT parent_id INTO cur FROM CATEGORIES WHERE category_id = cur;
-        IF cur = NEW.category_id THEN
-            RAISE EXCEPTION 'category cycle detected';
-        END IF;
-        depth := depth + 1;
-    END LOOP;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+Given a product catalog administrator, the system persists categories, products, variants, and SKUs without losing identity, relationship, price, or inventory meaning.
 
-DROP TRIGGER IF EXISTS trg_category_cycle ON CATEGORIES;
-CREATE TRIGGER trg_category_cycle
-    BEFORE INSERT OR UPDATE ON CATEGORIES
-    FOR EACH ROW EXECUTE FUNCTION prevent_category_cycle();
+**In scope:** category tree with stable identifiers and slugs; product creation and editing with status and description; variants and SKUs with unique codes, price, stock, and availability; authenticated administration; database constraints, migrations, seed data, and focused tests.
 
--- ---------- PRODUCTS ----------
-CREATE TABLE IF NOT EXISTS PRODUCTS (
-    product_id     SERIAL PRIMARY KEY,
-    category_id    INTEGER       NOT NULL,
-    name           VARCHAR(255)  NOT NULL,
-    slug           VARCHAR(255)  NOT NULL,
-    description    TEXT,
-    status         VARCHAR(20)   NOT NULL DEFAULT 'draft',
-    specifications JSONB         NOT NULL DEFAULT '{}'::jsonb,
-    created_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at     TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_products_slug UNIQUE (slug),
-    CONSTRAINT chk_products_status CHECK (status IN ('draft', 'published', 'archived')),
-    CONSTRAINT chk_products_specifications_object CHECK (jsonb_typeof(specifications) = 'object'),
-    CONSTRAINT fk_products_category
-        FOREIGN KEY (category_id) REFERENCES CATEGORIES (category_id)
-        ON UPDATE CASCADE ON DELETE RESTRICT
-);
+**Out of scope (Sprint 3+):** dynamic specification UI, asset upload, public catalog search, publication workflows, payment gateway, order placement, shipping, and full shopper checkout. These are stubbed only and are not claimed as Sprint 2 functionality.
 
-CREATE INDEX IF NOT EXISTS idx_products_category_id ON PRODUCTS (category_id);
-CREATE INDEX IF NOT EXISTS idx_products_status ON PRODUCTS (status);
+## 2. Sprint 1 decisions reused or changed
 
--- ---------- VARIANTS ----------
-CREATE TABLE IF NOT EXISTS VARIANTS (
-    variant_id    SERIAL PRIMARY KEY,
-    product_id    INTEGER      NOT NULL,
-    option_values JSONB        NOT NULL DEFAULT '{}'::jsonb,
-    created_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT chk_variants_option_values_object CHECK (jsonb_typeof(option_values) = 'object'),
-    CONSTRAINT fk_variants_product
-        FOREIGN KEY (product_id) REFERENCES PRODUCTS (product_id)
-        ON UPDATE CASCADE ON DELETE RESTRICT
-);
+See `docs/SPRINT_1.md`. **Reused:** React frontend, Node.js + Express backend, PostgreSQL, JWT authentication, relational modeling, and the electronics-only MVP boundary.
 
-CREATE INDEX IF NOT EXISTS idx_variants_product_id ON VARIANTS (product_id);
+**Changed / extended:**
+- Sprint 1 stored price and stock directly on PRODUCTS. Sprint 2 moves sellable price and stock to SKUS so every variant combination keeps its own identity, price, and stock.
+- New entities: VARIANTS, SKUS, ASSETS. Specifications are stored as validated JSONB on PRODUCTS.
+- The Sprint 1 ERD is extended, not replaced. Carts, Cart_Items, Orders, and Order_Items keep their Sprint 1 meaning and gain a planned `sku_id` link in Sprint 3.
 
--- ---------- SKUS ----------
-CREATE TABLE IF NOT EXISTS SKUS (
-    sku_id            SERIAL PRIMARY KEY,
-    variant_id        INTEGER      NOT NULL,
-    sku_code          VARCHAR(100) NOT NULL,
-    price_minor_units BIGINT       NOT NULL,
-    stock_quantity    INTEGER      NOT NULL DEFAULT 0,
-    is_active         BOOLEAN      NOT NULL DEFAULT TRUE,
-    created_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at        TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_skus_code UNIQUE (sku_code),
-    CONSTRAINT chk_skus_price_nonnegative CHECK (price_minor_units >= 0),
-    CONSTRAINT chk_skus_stock_nonnegative CHECK (stock_quantity >= 0),
-    CONSTRAINT fk_skus_variant
-        FOREIGN KEY (variant_id) REFERENCES VARIANTS (variant_id)
-        ON UPDATE CASCADE ON DELETE RESTRICT
-);
+## 3. Updated ERD and data dictionary
 
-CREATE INDEX IF NOT EXISTS idx_skus_variant_id ON SKUS (variant_id);
-CREATE INDEX IF NOT EXISTS idx_skus_code ON SKUS (sku_code);
+```mermaid
+erDiagram
+    CATEGORIES ||--o{ CATEGORIES : parent_of
+    CATEGORIES ||--o{ PRODUCTS : contains
+    PRODUCTS ||--o{ VARIANTS : has
+    VARIANTS ||--o{ SKUS : materializes
+    PRODUCTS ||--o{ ASSETS : displays
+    VARIANTS ||--o{ ASSETS : displays
+    PRODUCTS ||--o{ CART_ITEMS : selected_as
+    SKUS ||--o{ ORDER_ITEMS : sold_as
+    CARTS ||--|{ CART_ITEMS : contains
+    ORDERS ||--|{ ORDER_ITEMS : contains
 
--- ---------- ASSETS ----------
-CREATE TABLE IF NOT EXISTS ASSETS (
-    asset_id    SERIAL PRIMARY KEY,
-    product_id  INTEGER      NULL,
-    variant_id  INTEGER      NULL,
-    storage_key VARCHAR(255) NOT NULL,
-    role        VARCHAR(50)  NOT NULL DEFAULT 'gallery',
-    alt_text    VARCHAR(255),
-    sort_order  INTEGER      NOT NULL DEFAULT 0,
-    created_at  TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT fk_assets_product
-        FOREIGN KEY (product_id) REFERENCES PRODUCTS (product_id)
-        ON UPDATE CASCADE ON DELETE CASCADE,
-    CONSTRAINT fk_assets_variant
-        FOREIGN KEY (variant_id) REFERENCES VARIANTS (variant_id)
-        ON UPDATE CASCADE ON DELETE CASCADE,
-    CONSTRAINT chk_assets_owner CHECK (product_id IS NOT NULL OR variant_id IS NOT NULL)
-);
+    CATEGORIES {
+        INTEGER category_id PK
+        INTEGER parent_id FK
+        VARCHAR name
+        VARCHAR slug
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+    PRODUCTS {
+        INTEGER product_id PK
+        INTEGER category_id FK
+        VARCHAR name
+        VARCHAR slug
+        TEXT description
+        VARCHAR status
+        JSONB specifications
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+    VARIANTS {
+        INTEGER variant_id PK
+        INTEGER product_id FK
+        JSONB option_values
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+    SKUS {
+        INTEGER sku_id PK
+        INTEGER variant_id FK
+        VARCHAR sku_code
+        BIGINT price_minor_units
+        INTEGER stock_quantity
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+    ASSETS {
+        INTEGER asset_id PK
+        INTEGER product_id FK
+        INTEGER variant_id FK
+        VARCHAR storage_key
+        VARCHAR role
+        VARCHAR alt_text
+        INTEGER sort_order
+        TIMESTAMP created_at
+    }
+    CARTS {
+        INTEGER cart_id PK
+        INTEGER user_id FK
+    }
+    CART_ITEMS {
+        INTEGER cart_item_id PK
+        INTEGER cart_id FK
+        INTEGER product_id FK
+        INTEGER sku_id FK
+        INTEGER quantity
+    }
+    ORDERS {
+        INTEGER order_id PK
+        INTEGER user_id FK
+    }
+    ORDER_ITEMS {
+        INTEGER order_item_id PK
+        INTEGER order_id FK
+        INTEGER product_id FK
+        INTEGER sku_id FK
+        INTEGER quantity
+        BIGINT unit_price_minor_units
+    }
+```
 
-CREATE INDEX IF NOT EXISTS idx_assets_product_id ON ASSETS (product_id);
-CREATE INDEX IF NOT EXISTS idx_assets_variant_id ON ASSETS (variant_id);
+`CART_ITEMS.sku_id` and `ORDER_ITEMS.sku_id` are planned Sprint 3 foreign keys; until then those tables keep their Sprint 1 `product_id` links.
+
+### Data dictionary
+
+| Entity | Key columns | Meaning |
+|---|---|---|
+| CATEGORIES | category_id PK, parent_id FK, name, slug UNIQUE, is_active | Category tree; a category can never become its own ancestor |
+| PRODUCTS | product_id PK, category_id FK, name, slug UNIQUE, description, status, specifications JSONB | Catalog item; status = draft / published / archived |
+| VARIANTS | variant_id PK, product_id FK, option_values JSONB | One valid option combination, e.g. `{"color":"Silver","storage":"512GB"}` |
+| SKUS | sku_id PK, variant_id FK, sku_code UNIQUE, price_minor_units, stock_quantity, is_active | The sellable unit with its own price and stock |
+| ASSETS | asset_id PK, product_id FK, variant_id FK, storage_key, role, alt_text, sort_order | Image/manual placeholder (upload is Sprint 3) |
+
+## 4. Administration route table with examples
+
+Implemented in `backend/server.js`. Every route requires `Authorization: Bearer <admin JWT>`; missing or invalid token returns **401**, a valid token without admin role returns **403**.
+
+| Method | Route | Purpose |
+|---|---|---|
+| POST | /api/v1/admin/categories | Create category |
+| GET | /api/v1/admin/categories | Return category list/tree |
+| POST | /api/v1/admin/products | Create draft product |
+| GET | /api/v1/admin/products | Return administrative product records |
+| PATCH | /api/v1/admin/products/:id | Update product content or status |
+| POST | /api/v1/admin/products/:id/skus | Add validated SKU (creates the variant if missing) |
+| PATCH | /api/v1/admin/skus/:id | Update price, stock, or active status |
+
+Errors are JSON with an `error` key. Auth errors carry a machine-readable code; duplicate slugs/SKUs return a clear **409** client error, never a server traceback.
+
+### Example: create category (201)
+
+```http
+POST /api/v1/admin/categories
+Authorization: Bearer [REDACTED]
+
+{ "name": "Laptops", "slug": "laptops", "parent_id": 1, "is_active": true }
+```
+
+```json
+{ "category_id": 2, "name": "Laptops", "slug": "laptops", "parent_id": 1, "is_active": true }
+```
+
+### Example: duplicate slug (409)
+
+```json
+{ "error": "Duplicate slug" }
+```
+
+### Example: add SKU (201)
+
+```http
+POST /api/v1/admin/products/1/skus
+Authorization: Bearer [REDACTED]
+
+{ "variant_options": { "color": "Silver", "storage": "512GB" },
+  "sku_code": "AERO14-SLV-512", "price_minor_units": 9499900,
+  "stock_quantity": 10, "is_active": true }
+```
+
+```json
+{ "sku_id": 2, "variant_id": 2, "sku_code": "AERO14-SLV-512",
+  "price_minor_units": 9499900, "stock_quantity": 10, "is_active": true }
+```
+
+### Example: update SKU stock (200)
+
+```http
+PATCH /api/v1/admin/skus/2
+Authorization: Bearer [REDACTED]
+
+{ "stock_quantity": 8 }
+```
+
+### Example: no token (401)
+
+```json
+{ "error": { "code": "UNAUTHENTICATED", "message": "Token is required" } }
+```
+
+## 5. Data integrity and authorization decisions
+
+**Money:** stored as integer minor units (`price_minor_units` BIGINT, paisa). Rs 9,499.00 = `9499900`. Floating-point money is not used anywhere.
+
+**Database-enforced rules (CAT-05):** migration `migrations/002_catalog_foundation.sql` adds `UNIQUE (slug)` on categories and products, `UNIQUE (sku_code)` on SKUs, `CHECK (stock_quantity >= 0)`, `CHECK (price_minor_units >= 0)`, `CHECK (status IN ('draft','published','archived'))`, `CHECK (jsonb_typeof(specifications) = 'object')`, and a trigger `trg_category_cycle` that raises an error if a category would become its own ancestor. API validation alone is not relied upon.
+
+**Foreign key policies:**
+
+| Relationship | Policy | Reason |
+|---|---|---|
+| CATEGORIES.parent_id → CATEGORIES | ON UPDATE CASCADE, ON DELETE RESTRICT | A parent with children cannot be deleted by accident |
+| PRODUCTS.category_id → CATEGORIES | ON UPDATE CASCADE, ON DELETE RESTRICT | Products keep a stable canonical category |
+| VARIANTS.product_id → PRODUCTS | ON UPDATE CASCADE, ON DELETE RESTRICT | Protects variant/SKU identity |
+| SKUS.variant_id → VARIANTS | ON UPDATE CASCADE, ON DELETE RESTRICT | Protects sellable identity and history |
+| ASSETS.product_id / variant_id | ON UPDATE CASCADE, ON DELETE CASCADE | Assets belong to their owner |
+
+**Specification validation rule:** `specifications` must be a top-level JSON object; values must be strings, numbers, booleans, or arrays of scalars; nested objects are rejected by API validation and the JSONB check constraint.
+
+**Authorization (CAT-06):** all `/api/v1/admin` routes pass through a JWT middleware; writes and reads both require `role = admin`.
+
+### Business rules and edge cases
+
+1. **Draft without SKU?** Yes — a draft is not sellable yet. **Published without sellable SKU?** No — Sprint 3 publication rules must block public display when no active SKU exists.
+2. **One canonical category** per product (`PRODUCTS.category_id`): simple tree, clear breadcrumb, no duplicate placement. A join table can be added later without breaking this.
+3. **Parent deactivated:** children stay in the database and admin tree, but the whole subtree is treated as unavailable publicly until moved to an active parent.
+4. **Out-of-stock SKU:** stays `is_active = true` with `stock_quantity = 0`, represented as `availability: OUT_OF_STOCK`, not purchasable.
+5. **Two SKUs sharing a price:** allowed. **Price override:** the SKU owns its price in Sprint 2; promotional overrides are a Sprint 3 concern.
+6. **Negative stock / duplicate SKU codes:** prevented by `CHECK (stock_quantity >= 0)` and `UNIQUE (sku_code)` at the database level, plus API validation.
+7. **Deactivated product referenced by future cart/order:** never hard-deleted; it is archived or its SKU deactivated. Historical order items keep the SKU reference; checkout validates active/sellable status.
+
+## 6. Seed data and demonstration
+
+Reproducible seed: `seeds/02_catalog_seed.sql`, run after the migration:
+
+```bash
+createdb techbazar
+psql -d techbazar -f migrations/002_catalog_foundation.sql
+psql -d techbazar -f seeds/02_catalog_seed.sql
+```
+
+Seed contents: category tree `Electronics → Laptops / Audio / Mobile Accessories` (two levels); products `AeroBook 14` (4 variants), `SoundCore Mini`, `PowerCase 5000`; six valid SKUs (`AERO14-SLV-256`, `AERO14-SLV-512`, `AERO14-BLK-256`, `AERO14-BLK-512`, `SOUNDCORE-BLK`, `POWERCASE-5000`). The combination **AeroBook 14 Black / 1TB is intentionally unavailable** and is simply absent — not stored as a fake zero-stock SKU (CAT-04).
+
+Demonstration (administrator flow, tokens redacted): create category → create product → add SKU → retrieve records:
+
+```http
+POST /api/v1/admin/categories      → 201 (example above)
+POST /api/v1/admin/products        → 201 { "product_id": 1, "slug": "aerobook-14", "status": "draft" }
+POST /api/v1/admin/products/1/skus → 201 (example above)
+GET  /api/v1/admin/products        → 200 products with nested variants and SKUs
+```
+
+## 7. Test strategy, command, and result
+
+Automated tests live in `backend/tests/admin.test.js` (Node built-in `node:test`, no external dependencies). They cover success and rejection paths for authorization, required fields, duplicate slug, duplicate SKU, stock rules, category cycle prevention, and variant combination rules.
+
+Command:
+
+```bash
+node --test backend/tests/admin.test.js
+```
+
+Result:
+
+```text
+✔ CAT-06: admin role is allowed
+✔ CAT-06: non-admin is rejected
+✔ CAT-02: product creation accepts required fields
+✔ CAT-02: product creation rejects missing slug
+✔ CAT-02: duplicate slug is rejected
+✔ CAT-03: SKU creation accepts required fields
+✔ CAT-03: SKU creation rejects missing sku_code
+✔ CAT-03: duplicate SKU code is rejected
+✔ CAT-05: negative stock is rejected
+✔ CAT-05: zero stock is allowed (out-of-stock representation)
+✔ CAT-01: category cycle is prevented
+✔ CAT-01: valid category chain is accepted
+✔ CAT-04: existing variant combination is found
+✔ CAT-04: missing combination is absent, not a fake zero-stock SKU
+14 passing tests
+```
+
+Database-level rules (unique slug/SKU, non-negative stock, cycle trigger) are additionally enforced by constraints in `migrations/002_catalog_foundation.sql`.
+
+## 8. Known limitations and Sprint 3 backlog
+
+**Limitations:** no public catalog reads yet; asset upload not implemented (schema only); specifications validation is basic; publication is a status field without workflow; cart/checkout not yet SKU-aware.
+
+**Sprint 3 backlog (builds on this foundation, no duplicated pricing logic):** dynamic specifications, asset upload, public catalog reads, publication rules, catalog-to-cart readiness with `sku_id` on Cart_Items and Order_Items, search and category browsing.
